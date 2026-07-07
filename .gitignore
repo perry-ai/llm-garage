@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Runtime data
+data/presets.json
+data/runtime.log
+data/server.*.log
+data/*.pid
+
+# Local environment
+.env
+.env.*
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.log
+
+# .agent
+.agents/
+skills-lock.json
+
+
