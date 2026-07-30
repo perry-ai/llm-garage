@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ctypes
+import ipaddress
 import json
+import math
 import os
 import shlex
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.error
@@ -25,6 +28,15 @@ PRESETS_FILE = DATA_DIR / "presets.json"
 LOG_FILE = DATA_DIR / "runtime.log"
 PID_FILE = DATA_DIR / "llmgarage.pid"
 MAX_LOG_LINES = 500
+MAX_LOG_FILE_BYTES = 2 * 1024 * 1024
+MAX_LOG_BACKUPS = 3
+MAX_REQUEST_BODY_BYTES = 1024 * 1024
+
+
+class RequestError(Exception):
+    def __init__(self, status: int, message: str) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class RuntimeState:
@@ -32,6 +44,10 @@ class RuntimeState:
         self.process: subprocess.Popen[str] | None = None
         self.started_at: float | None = None
         self.command: list[str] = []
+        self.last_exit_code: int | None = None
+        self.last_exit_at: float | None = None
+        self.last_exit_reason: str | None = None
+        self.requested_exit_reason: str | None = None
         self.logs: deque[str] = deque(maxlen=MAX_LOG_LINES)
         self.lock = threading.RLock()
 
@@ -58,6 +74,22 @@ DEFAULT_PRESET = {
     "reranking": False,
     "advancedArgs": "",
 }
+
+PRESET_STRING_FIELDS = {"serverPath", "modelPath", "host", "advancedArgs"}
+PRESET_INTEGER_FIELDS = {
+    "port",
+    "ctxSize",
+    "gpuLayers",
+    "threads",
+    "batchSize",
+    "ubatchSize",
+    "parallel",
+}
+PRESET_FLOAT_FIELDS = {
+    "temperature",
+    "topP",
+}
+PRESET_BOOLEAN_FIELDS = {"embedding", "reranking"}
 
 
 def ensure_data_files() -> None:
@@ -88,17 +120,113 @@ def read_json(path: Path, fallback: Any) -> Any:
 
 def write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+            newline="\n",
+        ) as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        os.replace(temporary_path, path)
+    except Exception:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def validate_presets(presets: Any) -> list[dict[str, Any]]:
+    if not isinstance(presets, list):
+        raise ValueError("presets must be a list")
+
+    seen_ids: set[str] = set()
+    for index, preset in enumerate(presets):
+        label = f"preset {index + 1}"
+        if not isinstance(preset, dict):
+            raise ValueError(f"{label} must be an object")
+
+        preset_id = preset.get("id")
+        name = preset.get("name")
+        if not isinstance(preset_id, str) or not preset_id.strip() or len(preset_id) > 128:
+            raise ValueError(f"{label} id must be a non-empty string up to 128 characters")
+        if preset_id in seen_ids:
+            raise ValueError(f"duplicate preset id: {preset_id}")
+        seen_ids.add(preset_id)
+        if not isinstance(name, str) or not name.strip() or len(name) > 256:
+            raise ValueError(f"{label} name must be a non-empty string up to 256 characters")
+
+        for field in PRESET_STRING_FIELDS:
+            if field in preset and not isinstance(preset[field], str):
+                raise ValueError(f"{label} field {field} must be a string")
+        for field in PRESET_INTEGER_FIELDS:
+            value = preset.get(field, "")
+            if value in ("", "auto", None):
+                continue
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"{label} field {field} must be an integer or auto")
+        for field in PRESET_FLOAT_FIELDS:
+            value = preset.get(field, "")
+            if value in ("", "auto", None):
+                continue
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise ValueError(f"{label} field {field} must be a finite number or auto")
+        for field in PRESET_BOOLEAN_FIELDS:
+            if field in preset and not isinstance(preset[field], bool):
+                raise ValueError(f"{label} field {field} must be a boolean")
+
+        port = preset.get("port")
+        if port not in ("", "auto", None) and not 1 <= port <= 65535:
+            raise ValueError(f"{label} port must be between 1 and 65535")
+
+    return presets
+
+
+def rotated_log_path(index: int) -> Path:
+    return LOG_FILE.with_name(f"{LOG_FILE.stem}.{index}{LOG_FILE.suffix}")
+
+
+def rotate_log_if_needed(incoming_bytes: int) -> None:
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size + incoming_bytes <= MAX_LOG_FILE_BYTES:
+        return
+    rotated_log_path(MAX_LOG_BACKUPS).unlink(missing_ok=True)
+    for index in range(MAX_LOG_BACKUPS - 1, 0, -1):
+        source = rotated_log_path(index)
+        if source.exists():
+            os.replace(source, rotated_log_path(index + 1))
+    os.replace(LOG_FILE, rotated_log_path(1))
+
+
+def bounded_log_line(line: str) -> str:
+    suffix = " [truncated]"
+    if len((line + "\n").encode("utf-8")) <= MAX_LOG_FILE_BYTES:
+        return line
+    byte_budget = MAX_LOG_FILE_BYTES - len((suffix + "\n").encode("utf-8"))
+    prefix = line.encode("utf-8")[: max(0, byte_budget)].decode("utf-8", errors="ignore")
+    return prefix + suffix
 
 
 def add_log(message: str) -> None:
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    line = f"[{timestamp}] {message}"
+    line = bounded_log_line(f"[{timestamp}] {message}")
     with STATE.lock:
         STATE.logs.append(line)
-    DATA_DIR.mkdir(exist_ok=True)
-    with LOG_FILE.open("a", encoding="utf-8") as handle:
-        handle.write(line + "\n")
+        LOG_FILE.parent.mkdir(exist_ok=True)
+        encoded_line = (line + "\n").encode("utf-8")
+        rotate_log_if_needed(len(encoded_line))
+        with LOG_FILE.open("ab") as handle:
+            handle.write(encoded_line)
 
 
 def parse_extra_args(raw: str) -> list[str]:
@@ -239,6 +367,9 @@ def runtime_status() -> dict[str, Any]:
             "startedAt": STATE.started_at,
             "uptimeSeconds": int(time.time() - STATE.started_at) if running and STATE.started_at else 0,
             "command": command_preview(STATE.command) if STATE.command else "",
+            "lastExitCode": STATE.last_exit_code,
+            "lastExitAt": STATE.last_exit_at,
+            "lastExitReason": STATE.last_exit_reason,
             "appUrl": f"http://{HOST}:{PORT}",
         }
 
@@ -251,6 +382,37 @@ def read_stream(stream: Any, label: str) -> None:
             add_log(f"{label}: {line.rstrip()}")
     finally:
         stream.close()
+
+
+def finalize_process_exit(
+    process: subprocess.Popen[str],
+    returncode: int,
+    reason: str | None = None,
+    *,
+    log_exit: bool = True,
+) -> str | None:
+    with STATE.lock:
+        if STATE.process is not process:
+            return None
+        exit_reason = reason or STATE.requested_exit_reason or "unexpected"
+        STATE.last_exit_code = returncode
+        STATE.last_exit_at = time.time()
+        STATE.last_exit_reason = exit_reason
+        STATE.requested_exit_reason = None
+        STATE.process = None
+        STATE.started_at = None
+        STATE.command = []
+    if log_exit:
+        add_log(
+            f"llama-server process PID {process.pid} exited with code {returncode} "
+            f"({exit_reason})."
+        )
+    return exit_reason
+
+
+def watch_process(process: subprocess.Popen[str]) -> None:
+    returncode = process.wait()
+    finalize_process_exit(process, returncode)
 
 
 def start_process(preset: dict[str, Any]) -> dict[str, Any]:
@@ -278,41 +440,50 @@ def start_process(preset: dict[str, Any]) -> dict[str, Any]:
         STATE.process = process
         STATE.started_at = time.time()
         STATE.command = argv
+        STATE.last_exit_code = None
+        STATE.last_exit_at = None
+        STATE.last_exit_reason = None
+        STATE.requested_exit_reason = None
 
     add_log("Started llama-server: " + command_preview(argv))
     if process.stdout:
         threading.Thread(target=read_stream, args=(process.stdout, "stdout"), daemon=True).start()
     if process.stderr:
         threading.Thread(target=read_stream, args=(process.stderr, "stderr"), daemon=True).start()
+    threading.Thread(target=watch_process, args=(process,), daemon=True).start()
     return {"ok": True, "messages": ["llama-server started."], "status": runtime_status()}
 
 
 def stop_process() -> dict[str, Any]:
     with STATE.lock:
         process = STATE.process
-        if process is None or process.poll() is not None:
-            STATE.process = None
-            STATE.started_at = None
-            STATE.command = []
+        if process is None:
+            return {"ok": True, "messages": ["No LLMGarage-managed process is running."]}
+        returncode = process.poll()
+        if returncode is not None:
+            finalize_process_exit(process, returncode)
             return {"ok": True, "messages": ["No LLMGarage-managed process is running."]}
         pid = process.pid
+        STATE.requested_exit_reason = "stopped"
         process.terminate()
     try:
-        process.wait(timeout=8)
-        add_log(f"Stopped LLMGarage-managed llama-server process PID {pid}.")
+        returncode = process.wait(timeout=8)
+        add_log(f"Stopped LLMGarage-managed llama-server process PID {pid} with code {returncode}.")
     except subprocess.TimeoutExpired:
         process.kill()
-        add_log(f"Force killed LLMGarage-managed llama-server process PID {pid}.")
-    with STATE.lock:
-        STATE.process = None
-        STATE.started_at = None
-        STATE.command = []
+        returncode = process.wait(timeout=2)
+        add_log(f"Force killed LLMGarage-managed llama-server process PID {pid} with code {returncode}.")
+    finalize_process_exit(process, returncode, "stopped", log_exit=False)
     return {"ok": True, "messages": [f"Stopped process PID {pid}."]}
 
 
 def kill_all_llama_servers() -> dict[str, Any]:
     if os.name != "nt":
         return {"ok": False, "messages": ["Global stop is only implemented for Windows."]}
+    with STATE.lock:
+        managed_process = STATE.process
+        if managed_process is not None and managed_process.poll() is None:
+            STATE.requested_exit_reason = "killed"
     result = subprocess.run(
         ["taskkill", "/IM", "llama-server.exe", "/F"],
         capture_output=True,
@@ -324,11 +495,31 @@ def kill_all_llama_servers() -> dict[str, Any]:
     output = (result.stdout + result.stderr).strip()
     add_log("Global stop llama-server.exe result: " + (output or f"exit code {result.returncode}"))
     with STATE.lock:
-        if STATE.process is not None and STATE.process.poll() is not None:
-            STATE.process = None
-            STATE.started_at = None
-            STATE.command = []
+        managed_process = STATE.process
+        managed_returncode = managed_process.poll() if managed_process is not None else None
+        if (
+            result.returncode != 0
+            and managed_process is not None
+            and managed_returncode is None
+            and STATE.requested_exit_reason == "killed"
+        ):
+            STATE.requested_exit_reason = None
+    if managed_process is not None and managed_returncode is not None:
+        finalize_process_exit(managed_process, managed_returncode)
     return {"ok": result.returncode == 0, "messages": [output or f"taskkill exited {result.returncode}"]}
+
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: urllib.request.Request,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        return None
 
 
 def request_json(url: str, payload: dict[str, Any] | None = None, timeout: int = 10) -> dict[str, Any]:
@@ -338,7 +529,8 @@ def request_json(url: str, payload: dict[str, Any] | None = None, timeout: int =
         data = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     request = urllib.request.Request(url, data=data, headers=headers)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    opener = urllib.request.build_opener(NoRedirectHandler)
+    with opener.open(request, timeout=timeout) as response:
         body = response.read().decode("utf-8", errors="replace")
         try:
             parsed = json.loads(body) if body else None
@@ -367,7 +559,7 @@ def api_test_prompt(payload: dict[str, Any]) -> dict[str, Any]:
     chat_payload = {
         "model": "local",
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": "",
+        "temperature": 0.2,
         "max_tokens": 96,
     }
     try:
@@ -383,7 +575,68 @@ def api_test_prompt(payload: dict[str, Any]) -> dict[str, Any]:
 def base_url(payload: dict[str, Any]) -> str:
     host = str(payload.get("host") or "127.0.0.1").strip()
     port = coerce_int(payload.get("port"), 8080)
-    return f"http://{host}:{port}"
+    if port < 1 or port > 65535:
+        raise ValueError("Local llama-server port must be between 1 and 65535.")
+    if host == "0.0.0.0":
+        host = "127.0.0.1"
+    elif host in ("::", "[::]"):
+        host = "::1"
+    if host.lower() == "localhost":
+        request_host = "localhost"
+    else:
+        unwrapped_host = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        try:
+            address = ipaddress.ip_address(unwrapped_host)
+        except ValueError as exc:
+            raise ValueError("Only local llama-server hosts are allowed.") from exc
+        if not address.is_loopback:
+            raise ValueError("Only local llama-server hosts are allowed.")
+        request_host = f"[{address}]" if address.version == 6 else str(address)
+    return f"http://{request_host}:{port}"
+
+
+def normalized_loopback_hostname(hostname: str | None) -> str | None:
+    if not hostname:
+        return None
+    if hostname.lower() == "localhost":
+        return "localhost"
+    try:
+        address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return None
+    return str(address) if address.is_loopback else None
+
+
+def is_allowed_browser_origin(
+    origin: str | None,
+    request_host: str | None,
+    server_port: int,
+) -> bool:
+    if not origin:
+        return True
+    if not request_host:
+        return False
+    try:
+        parsed_origin = urlparse(origin)
+        parsed_request_host = urlparse(f"http://{request_host}")
+        origin_port = parsed_origin.port
+        request_port = parsed_request_host.port
+    except ValueError:
+        return False
+    if (
+        parsed_origin.scheme != "http"
+        or parsed_origin.path
+        or parsed_origin.query
+        or parsed_origin.fragment
+        or parsed_origin.username
+        or parsed_origin.password
+        or origin_port != server_port
+        or request_port != server_port
+    ):
+        return False
+    origin_hostname = normalized_loopback_hostname(parsed_origin.hostname)
+    request_hostname = normalized_loopback_hostname(parsed_request_host.hostname)
+    return origin_hostname is not None and origin_hostname == request_hostname
 
 
 class LLMGarageHandler(BaseHTTPRequestHandler):
@@ -406,12 +659,17 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
-        payload = self.read_body()
+        if not is_allowed_browser_origin(
+            self.headers.get("Origin"),
+            self.headers.get("Host"),
+            self.server.server_port,
+        ):
+            self.send_json({"ok": False, "messages": ["Cross-origin requests are not allowed."]}, status=403)
+            return
         try:
+            payload = self.read_body()
             if parsed.path == "/api/presets":
-                presets = payload.get("presets", [])
-                if not isinstance(presets, list):
-                    raise ValueError("presets must be a list")
+                presets = validate_presets(payload.get("presets", []))
                 write_json(PRESETS_FILE, {"presets": presets})
                 add_log(f"Saved {len(presets)} preset(s).")
                 self.send_json({"ok": True, "presets": presets})
@@ -435,12 +693,16 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
             else:
                 self.send_json({"ok": False, "messages": ["Unknown API endpoint."]}, status=404)
+        except RequestError as exc:
+            self.send_json({"ok": False, "messages": [str(exc)]}, status=exc.status)
         except Exception as exc:
             add_log(f"API error at {parsed.path}: {exc}")
             self.send_json({"ok": False, "messages": [str(exc)]}, status=400)
 
     def read_body(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
+        if length > MAX_REQUEST_BODY_BYTES:
+            raise RequestError(413, f"Request body exceeds the {MAX_REQUEST_BODY_BYTES}-byte limit.")
         if length <= 0:
             return {}
         raw = self.rfile.read(length).decode("utf-8")

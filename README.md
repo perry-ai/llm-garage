@@ -18,6 +18,7 @@ LLMGarage 是一个面向新手的本地大模型启动工具。它当前提供�
 - Windows 下支持强制停止所有 `llama-server.exe` 进程
 - 查看运行日志
 - 调用 `/health`、`/v1/models` 或 OpenAI 兼容接口做简单连通性测试
+- 控制接口拒绝跨站写入，并只允许测试本机 llama-server
 
 ### 路线图
 
@@ -63,7 +64,7 @@ stop.bat
 
 ### 本地数据
 
-LLMGarage 会在 `data/` 下保存本地预设、日志和 pid 文件。`data/presets.json` 可能包含你的本机路径和模型路径，默认不会被 Git 追踪。
+LLMGarage 会在 `data/` 下保存本地预设、日志和 pid 文件。预设通过原子替换保存，运行日志达到 2 MiB 后轮转并保留 3 份历史文件。`data/presets.json` 可能包含你的本机路径和模型路径，默认不会被 Git 追踪。
 
 ### 测试
 
@@ -91,6 +92,7 @@ The long-term goal is an all-in-one local AI app that can detect GPUs, recommend
 - Force-stop all `llama-server.exe` processes on Windows
 - View runtime logs
 - Run simple connectivity checks through `/health`, `/v1/models`, or OpenAI-compatible endpoints
+- Reject cross-origin control requests and restrict connectivity tests to local llama-server instances
 
 ### Roadmap
 
@@ -136,7 +138,7 @@ stop.bat
 
 ### Local Data
 
-LLMGarage stores local presets, logs, and pid files under `data/`. `data/presets.json` may contain local filesystem paths and model paths, so it is ignored by Git by default.
+LLMGarage stores local presets, logs, and pid files under `data/`. Presets are saved with atomic replacement, and runtime logs rotate at 2 MiB with 3 backups retained. `data/presets.json` may contain local filesystem paths and model paths, so it is ignored by Git by default.
 
 ### Tests
 

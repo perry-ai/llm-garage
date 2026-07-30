@@ -1,5 +1,17 @@
 # Project Rules
 
+## Git Workflow
+
+Use GitFlow for all development:
+
+- `main` contains production-ready code.
+- `develop` is the integration branch for upcoming releases.
+- Create `feature/<name>` branches from `develop` for new capabilities.
+- Create `release/<version>` branches from `develop` for release stabilization.
+- Create `hotfix/<name>` branches from `main` for urgent fixes and production hardening.
+- Merge hotfixes back into both `main` and `develop` when `develop` exists.
+- Do not commit directly to `main` or `develop`; use pull requests.
+
 ## Commit Messages
 
 Use the gitemoji style for commit messages:
