@@ -1,8 +1,10 @@
 import http.client
 import json
 import os
+import socket
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -70,6 +72,246 @@ def post_with_declared_length(url, length):
 def get_json(url):
     with urllib.request.urlopen(url, timeout=2) as response:
         return response.status, json.loads(response.read().decode("utf-8"))
+
+
+class HardwareApiTests(unittest.TestCase):
+    def test_console_links_to_advisor_without_embedding_advisor_regions(self):
+        with running_http_server() as base:
+            with urllib.request.urlopen(base + "/", timeout=2) as response:
+                html = response.read().decode("utf-8")
+
+        self.assertIn('href="/advisor"', html)
+        self.assertNotIn('id="hardwareSummary"', html)
+        self.assertNotIn('id="recommendationModels"', html)
+        self.assertNotIn('id="recommendationRules"', html)
+        self.assertNotIn('id="learningTopics"', html)
+
+    def test_advisor_page_exposes_hardware_recommendation_and_learning_regions(self):
+        with running_http_server() as base:
+            with urllib.request.urlopen(base + "/advisor", timeout=2) as response:
+                html = response.read().decode("utf-8")
+
+        self.assertIn('id="hardwareSummary"', html)
+        self.assertIn('id="recommendationModels"', html)
+        self.assertIn('id="recommendationRules"', html)
+        self.assertIn('id="learningTopics"', html)
+        self.assertIn('id="refreshRecommendationsBtn"', html)
+        self.assertIn('src="/advisor.js"', html)
+        self.assertNotIn('src="/app.js"', html)
+
+    def test_app_metadata_advertises_advisor_capability(self):
+        with running_http_server() as base:
+            status, payload = get_json(base + "/api/app")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["name"], "LLMGarage")
+        self.assertEqual(payload["pid"], os.getpid())
+        self.assertIn("advisor", payload["capabilities"])
+        self.assertIn("hardware-recommendations", payload["capabilities"])
+
+    def test_hardware_report_is_available_over_http(self):
+        with running_http_server() as base:
+            status, payload = get_json(base + "/api/hardware")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn(payload["recommendationPath"], {"nvidia", "cpu"})
+        self.assertIn("physicalCores", payload["cpu"])
+        self.assertIn("logicalThreads", payload["cpu"])
+        self.assertIn("ramTotalGiB", payload["memory"])
+        self.assertIn("available", payload["nvidiaSmi"])
+
+    def test_recommendations_api_combines_hardware_models_and_learning(self):
+        with running_http_server() as base:
+            status, payload = get_json(base + "/api/recommendations")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertIn("recommendationPath", payload["hardware"])
+        self.assertGreaterEqual(len(payload["models"]), 5)
+        self.assertLessEqual(len(payload["models"]), 8)
+        self.assertGreaterEqual(len(payload["learning"]), 10)
+        self.assertEqual(
+            payload["assumptions"]["rulesVersion"],
+            "p1-2026-07-31",
+        )
+
+
+class AppStartupTests(unittest.TestCase):
+    def test_replace_hands_running_port_to_new_app_process(self):
+        data_directory = TemporaryDirectory()
+        environment = os.environ.copy()
+        environment["LLMGARAGE_DATA_DIR"] = data_directory.name
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+
+        command = [sys.executable, str(Path(app.__file__).resolve()), "--port", str(port)]
+        first = subprocess.Popen(
+            command,
+            cwd=Path(app.__file__).resolve().parent,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=environment,
+        )
+        second = None
+        try:
+            first_metadata = self.wait_for_app(port)
+            self.assertIn("hardware-recommendations", first_metadata["capabilities"])
+            first_app_pid = first_metadata["pid"]
+
+            second = subprocess.Popen(
+                [*command, "--replace"],
+                cwd=Path(app.__file__).resolve().parent,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+            )
+
+            second_metadata = self.wait_for_app(port, replaced_pid=first_app_pid)
+            self.assertNotEqual(second_metadata["pid"], first_app_pid)
+            first.wait(timeout=4)
+            status, recommendations = get_json(
+                f"http://127.0.0.1:{port}/api/recommendations"
+            )
+            self.assertEqual(status, 200)
+            self.assertTrue(recommendations["ok"])
+        finally:
+            try:
+                post_raw(
+                    f"http://127.0.0.1:{port}/api/shutdown",
+                    b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+            except (OSError, urllib.error.URLError):
+                pass
+            for process in (second, first):
+                if process is None:
+                    continue
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=3)
+            data_directory.cleanup()
+
+    @unittest.skipUnless(os.name == "nt", "Legacy process replacement uses Windows taskkill.")
+    def test_replace_recovers_when_legacy_shutdown_does_not_release_port(self):
+        legacy_source = r"""
+import json
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class LegacyHandler(BaseHTTPRequestHandler):
+    server_version = "LLMGarage/0.1"
+
+    def send_payload(self, status, payload):
+        body = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        self.send_payload(404, {"ok": False, "messages": ["Unknown API endpoint."]})
+
+    def do_POST(self):
+        if self.path == "/api/shutdown":
+            self.send_payload(200, {"ok": True})
+        else:
+            self.send_payload(404, {"ok": False})
+
+    def log_message(self, *_):
+        pass
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), LegacyHandler).serve_forever()
+"""
+        data_directory = TemporaryDirectory()
+        environment = os.environ.copy()
+        environment["LLMGARAGE_DATA_DIR"] = data_directory.name
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
+            reservation.bind(("127.0.0.1", 0))
+            port = reservation.getsockname()[1]
+
+        legacy = subprocess.Popen(
+            [sys.executable, "-c", legacy_source, str(port)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        replacement = None
+        try:
+            self.wait_for_listener(port)
+            replacement = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(Path(app.__file__).resolve()),
+                    "--port",
+                    str(port),
+                    "--replace",
+                ],
+                cwd=Path(app.__file__).resolve().parent,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+            )
+
+            metadata = self.wait_for_app(port, replaced_pid=-1, timeout=8)
+            self.assertIn("hardware-recommendations", metadata["capabilities"])
+            legacy.wait(timeout=4)
+        finally:
+            try:
+                post_raw(
+                    f"http://127.0.0.1:{port}/api/shutdown",
+                    b"{}",
+                    headers={"Content-Type": "application/json"},
+                )
+            except (OSError, urllib.error.URLError):
+                pass
+            for process in (replacement, legacy):
+                if process is None:
+                    continue
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(
+                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                        check=False,
+                        capture_output=True,
+                    )
+                    process.wait(timeout=3)
+            data_directory.cleanup()
+
+    def wait_for_listener(self, port):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        self.fail(f"No process listened on port {port}.")
+
+    def wait_for_app(self, port, *, replaced_pid=None, timeout=5):
+        deadline = time.monotonic() + timeout
+        last_error = None
+        while time.monotonic() < deadline:
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                    pass
+                _, payload = get_json(f"http://127.0.0.1:{port}/api/app")
+                if replaced_pid is None or payload.get("pid") != replaced_pid:
+                    return payload
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                exc.close()
+            except (OSError, urllib.error.URLError) as exc:
+                last_error = exc
+            time.sleep(0.05)
+        self.fail(
+            f"LLMGarage did not claim port {port} after replacing PID {replaced_pid}: {last_error}"
+        )
 
 
 class HttpSecurityTests(unittest.TestCase):

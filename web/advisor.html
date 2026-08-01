@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>机况、模型推荐与学习台 · LLMGarage</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="paper advisor-paper">
+      <header class="masthead">
+        <div class="edition-line">
+          <span>P1 · MACHINE ADVISOR</span>
+          <span>hardware facts before recommendations</span>
+          <a class="text-link" href="/">返回控制台</a>
+        </div>
+        <div class="nameplate advisor-nameplate">
+          <div>
+            <p class="kicker">LEARN WHILE DOING</p>
+            <h1>机况、模型推荐与学习台</h1>
+            <p class="masthead-copy">
+              先看事实，再给建议。这里是独立的只读页面，不会修改预设，也不会启动 llama.cpp。
+            </p>
+          </div>
+          <div class="advisor-status-box">
+            <span id="hardwareRoute" class="route-badge">等待检测</span>
+            <span id="recommendationStatus">等待检测本机硬件</span>
+            <button id="refreshRecommendationsBtn" type="button">重新检测</button>
+          </div>
+        </div>
+      </header>
+
+      <section id="advisorError" class="notice advisor-error" hidden>
+        <strong>检测没有完成</strong>
+        <p id="advisorErrorMessage"></p>
+        <p>如果提示后台版本过旧，请关闭旧窗口后重新运行 <code>start.bat</code>。</p>
+      </section>
+
+      <div class="advisor-body advisor-standalone">
+        <p class="advisor-lead">
+          推荐器优先保证第一次稳定启动；所有内存与卸载数字都是透明的保守估算，最终以 llama.cpp 启动日志为准。
+        </p>
+
+        <section aria-labelledby="hardwareHeading">
+          <div class="advisor-section-heading">
+            <div>
+              <span>01 / HARDWARE</span>
+              <h2 id="hardwareHeading">这台机器检测到了什么</h2>
+            </div>
+          </div>
+          <div id="hardwareSummary" class="hardware-summary" aria-live="polite">
+            <p class="loading-copy">正在读取 CPU、RAM、GPU、VRAM 与 nvidia-smi…</p>
+          </div>
+        </section>
+
+        <section aria-labelledby="recommendationHeading">
+          <div class="advisor-section-heading">
+            <div>
+              <span>02 / RECOMMENDATIONS</span>
+              <h2 id="recommendationHeading">稳妥档 + 吃力档模型清单</h2>
+            </div>
+            <span id="rulesVersion" class="route-badge">rules —</span>
+          </div>
+          <p id="recommendationPosture" class="advisor-note"></p>
+          <div id="recommendationModels" class="model-grid" aria-live="polite"></div>
+        </section>
+
+        <details class="rules-fold">
+          <summary>查看透明推荐规则与内存假设</summary>
+          <div id="recommendationRules" class="rules-grid"></div>
+          <div id="recommendationAssumptions" class="assumption-panel"></div>
+        </details>
+
+        <section aria-labelledby="learningHeading">
+          <div class="advisor-section-heading">
+            <div>
+              <span>03 / LEARN WHILE DOING</span>
+              <h2 id="learningHeading">把每个旋钮讲明白</h2>
+            </div>
+            <span class="route-badge">10 topics</span>
+          </div>
+          <p class="advisor-note">
+            包含参数量、量化、GGUF、权重内存、KV cache，以及 CPU、GPU 全卸载、CPU+GPU 混合卸载和 GPU 层数选择原理。
+          </p>
+          <div id="learningTopics" class="learning-grid"></div>
+        </section>
+      </div>
+    </main>
+
+    <script src="/advisor.js"></script>
+  </body>
+</html>

@@ -114,7 +114,14 @@ It contains:
 - 校验、启动、停止、停止全部 / Validate, start, stop, and kill-all actions.
 - API 健康检查和 Prompt 测试 / API health check and prompt test.
 - 运行日志 / Runtime logs.
+- 进入 `/advisor` 的入口 / Entry point to `/advisor`.
 - 进入 `/onboarding` 的入口 / Entry point to `/onboarding`.
+
+### `/advisor` Machine Advisor / 机况、推荐与学习台
+
+`/advisor` 是按需打开的只读判断与学习页面。它承载硬件检测结果、稳妥模型推荐、透明预算，以及 CPU、GPU 与混合卸载原理；默认 `/` 不嵌入这些内容。
+
+`/advisor` is an on-demand, read-only judgment and learning surface. It contains hardware facts, stable model recommendations, transparent budgets, and CPU, GPU, and hybrid offload explanations. The default `/` console does not embed this content.
 
 ### `/onboarding` Wall Chart / 新手流程图
 
@@ -153,6 +160,7 @@ Build the first vertical slice: detect the machine and explain why certain model
 - 展示少量稳妥推荐模型 / Show a small set of stable recommended models.
 - 解释推荐原因 / Explain why each model is recommended.
 - 讲清参数量、量化、内存和 KV cache / Explain parameters, quantization, memory, and KV cache.
+- 在独立 `/advisor` 路由展示，不挤占默认控制台 / Present this slice on the dedicated `/advisor` route instead of embedding it in the default console.
 
 推荐姿态 / Recommendation posture:
 
@@ -211,7 +219,7 @@ Support ModelScope first, then Hugging Face. ModelScope is important for the int
 范围 / Scope:
 
 - 保持推荐模型少而精选 / Keep the first model list small and curated.
-- 为推荐模型提供 ModelScope 链接 / Provide ModelScope links for recommendations.
+- 在现有 ModelScope 社区页面链接上增加下载辅助 / Build download assistance on the existing ModelScope model-page links.
 - 支持打开社区页面 / Allow opening the model page.
 - 支持复制下载链接或命令 / Allow copying a download link or command.
 - 支持选择手动下载的 GGUF 文件 / Allow selecting a manually downloaded GGUF file.
