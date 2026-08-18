@@ -350,7 +350,6 @@ function bindEvents() {
   });
   $("healthBtn").addEventListener("click", () => healthCheck().catch(showError));
   $("testPromptBtn").addEventListener("click", () => testPrompt().catch(showError));
-
   bindTipPanels();
 
   $("presetName").addEventListener("input", () => setDirty(true));

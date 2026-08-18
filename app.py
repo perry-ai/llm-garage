@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import ctypes
 import ipaddress
 import json
@@ -12,18 +13,28 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import webbrowser
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from hardware import HardwareSnapshotCache, detect_hardware
+from recommendations import build_recommendation_report
+
 
 HOST = "127.0.0.1"
 PORT = 58001
+APP_VERSION = "0.2.0"
+APP_CAPABILITIES = (
+    "console",
+    "advisor",
+    "hardware-recommendations",
+)
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("LLMGARAGE_DATA_DIR", ROOT / "data")).resolve()
 PRESETS_FILE = DATA_DIR / "presets.json"
 LOG_FILE = DATA_DIR / "runtime.log"
 PID_FILE = DATA_DIR / "llmgarage.pid"
@@ -53,6 +64,12 @@ class RuntimeState:
 
 
 STATE = RuntimeState()
+HARDWARE_CACHE = HardwareSnapshotCache(detect_hardware, max_age_seconds=2)
+
+
+class LLMGarageHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = False
+    daemon_threads = True
 
 
 DEFAULT_PRESET = {
@@ -640,11 +657,22 @@ def is_allowed_browser_origin(
 
 
 class LLMGarageHandler(BaseHTTPRequestHandler):
-    server_version = "LLMGarage/0.1"
+    server_version = f"LLMGarage/{APP_VERSION}"
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/state":
+        if parsed.path == "/api/app":
+            self.send_json(
+                {
+                    "ok": True,
+                    "name": "LLMGarage",
+                    "version": APP_VERSION,
+                    "pid": os.getpid(),
+                    "appUrl": f"http://{HOST}:{self.server.server_port}",
+                    "capabilities": list(APP_CAPABILITIES),
+                }
+            )
+        elif parsed.path == "/api/state":
             self.send_json(runtime_status())
         elif parsed.path == "/api/logs":
             with STATE.lock:
@@ -652,6 +680,10 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/presets":
             ensure_data_files()
             self.send_json(read_json(PRESETS_FILE, {"presets": [DEFAULT_PRESET]}))
+        elif parsed.path == "/api/hardware":
+            self.send_json(HARDWARE_CACHE.get())
+        elif parsed.path == "/api/recommendations":
+            self.send_json(build_recommendation_report(HARDWARE_CACHE.get()))
         elif parsed.path.startswith("/api/"):
             self.send_json({"ok": False, "messages": ["Unknown API endpoint."]}, status=404)
         else:
@@ -709,8 +741,14 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
         return json.loads(raw) if raw else {}
 
     def serve_static(self, request_path: str) -> None:
-        if request_path in ("", "/"):
-            file_path = WEB_DIR / "index.html"
+        route_files = {
+            "": "index.html",
+            "/": "index.html",
+            "/advisor": "advisor.html",
+            "/advisor/": "advisor.html",
+        }
+        if request_path in route_files:
+            file_path = WEB_DIR / route_files[request_path]
         else:
             relative = request_path.lstrip("/")
             file_path = (WEB_DIR / relative).resolve()
@@ -728,6 +766,7 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
         body = file_path.read_bytes()
         self.send_response(200)
         self.send_header("Content-Type", content_type)
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -736,6 +775,7 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -748,20 +788,171 @@ class LLMGarageHandler(BaseHTTPRequestHandler):
             return
         add_log("llmgarage: " + message)
 
-def main() -> None:
+def existing_llmgarage_server(host: str, port: int, *, timeout: float = 1.0) -> bool:
+    request = urllib.request.Request(f"http://{host}:{port}/api/app", method="GET")
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        response = exc
+    except (OSError, urllib.error.URLError):
+        return False
+    try:
+        return response.headers.get("Server", "").startswith("LLMGarage/")
+    finally:
+        response.close()
+
+
+def request_existing_shutdown(host: str, port: int, *, timeout: float = 1.0) -> bool:
+    if not existing_llmgarage_server(host, port, timeout=timeout):
+        return False
+    request = urllib.request.Request(
+        f"http://{host}:{port}/api/shutdown",
+        data=b"{}",
+        headers={
+            "Content-Type": "application/json",
+            "Origin": f"http://{host}:{port}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status == 200
+    except (OSError, urllib.error.URLError):
+        return False
+
+
+def windows_listener_pid(host: str, port: int) -> int | None:
+    if os.name != "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    expected_address = f"{host}:{port}".lower()
+    for line in result.stdout.splitlines():
+        columns = line.split()
+        if len(columns) < 5 or columns[0].upper() != "TCP":
+            continue
+        if columns[1].lower() != expected_address or columns[3].upper() != "LISTENING":
+            continue
+        try:
+            return int(columns[4])
+        except ValueError:
+            return None
+    return None
+
+
+def force_stop_existing_llmgarage(host: str, port: int) -> bool:
+    if os.name != "nt" or not existing_llmgarage_server(host, port):
+        return False
+    pid = windows_listener_pid(host, port)
+    if pid is None or pid == os.getpid():
+        return False
+    try:
+        result = subprocess.run(
+            ["taskkill", "/PID", str(pid), "/F"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode == 0:
+        add_log(f"Force stopped verified stale LLMGarage dashboard process PID {pid}.")
+        return True
+    return False
+
+
+def create_http_server(
+    host: str,
+    port: int,
+    *,
+    replace_existing: bool = False,
+    wait_seconds: float = 5.0,
+) -> LLMGarageHTTPServer:
+    try:
+        return LLMGarageHTTPServer((host, port), LLMGarageHandler)
+    except OSError as first_error:
+        if not replace_existing:
+            raise
+        if not request_existing_shutdown(host, port):
+            raise RuntimeError(
+                f"Port {port} is occupied by a service that is not a replaceable LLMGarage instance."
+            ) from first_error
+
+    deadline = time.monotonic() + wait_seconds
+    graceful_deadline = min(deadline, time.monotonic() + 1.5)
+    last_error: OSError | None = None
+    while time.monotonic() < graceful_deadline:
+        try:
+            return LLMGarageHTTPServer((host, port), LLMGarageHandler)
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    force_stop_existing_llmgarage(host, port)
+    while time.monotonic() < deadline:
+        try:
+            return LLMGarageHTTPServer((host, port), LLMGarageHandler)
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.05)
+    raise RuntimeError(
+        f"The previous LLMGarage instance did not release port {port} within {wait_seconds:g} seconds."
+    ) from last_error
+
+
+def parse_cli_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run the local LLMGarage web application.")
+    parser.add_argument("--port", type=int, default=PORT, help="Local HTTP port.")
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="Replace a verified existing LLMGarage instance on the selected port.",
+    )
+    parser.add_argument(
+        "--open-browser",
+        action="store_true",
+        help="Open the console after the HTTP socket is ready.",
+    )
+    args = parser.parse_args(argv)
+    if args.port < 1 or args.port > 65535:
+        parser.error("--port must be between 1 and 65535")
+    return args
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_cli_args(argv)
     ensure_data_files()
-    url = f"http://{HOST}:{PORT}"
+    url = f"http://{HOST}:{args.port}"
+    try:
+        server = create_http_server(HOST, args.port, replace_existing=args.replace)
+    except (OSError, RuntimeError) as exc:
+        print(f"LLMGarage could not start: {exc}")
+        return 1
     write_app_pid()
     add_log(f"LLMGarage listening on {url}")
     print(f"LLMGarage: {url}")
+    if args.open_browser:
+        webbrowser.open(url)
     try:
-        ThreadingHTTPServer((HOST, PORT), LLMGarageHandler).serve_forever()
+        server.serve_forever()
     finally:
+        server.server_close()
         clear_app_pid()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
 
 
 

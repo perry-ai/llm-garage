@@ -12,7 +12,7 @@
         <div class="edition-line">
           <span>&#x672c;&#x5730;&#x7248;</span>
           <span id="appUrl">127.0.0.1:58001</span>
-          <span>local LLM garage</span>
+          <a class="text-link" href="/advisor">机况、模型推荐与学习台 →</a>
         </div>
         <div class="nameplate">
           <div>
@@ -72,7 +72,7 @@
             <label class="field"><span>Port</span><input id="port" type="number" min="1" max="65535" /></label>
             <label class="field"><span>Context</span><input id="ctxSize" type="number" min="0" /></label>
             <label class="field auto-field">
-              <span class="label-row">GPU Layers <button class="tip" type="button" aria-expanded="false" aria-label="show parameter help" data-tip="&#x5bf9;&#x5e94; --gpu-layers&#x3002;&#x63a7;&#x5236;&#x5c06;&#x591a;&#x5c11;&#x5c42;&#x6a21;&#x578b;&#x5378;&#x8f7d;&#x5230; GPU&#x3002;&#x663e;&#x5b58;&#x8db3;&#x591f;&#x65f6;&#x53ef;&#x9002;&#x5f53;&#x8c03;&#x9ad8;&#xff1b;&#x663e;&#x5b58;&#x4e0d;&#x8db3;&#x6216;&#x4e0d;&#x786e;&#x5b9a;&#x65f6;&#x7528;&#x81ea;&#x52a8;&#x3002;">?</button></span>
+              <span class="label-row">GPU Layers <button class="tip" type="button" aria-expanded="false" aria-label="show parameter help" data-tip="对应 --gpu-layers（-ngl）。锁定研究版本支持整数、auto 和 all，默认 auto。数值不是 GPU 百分比：输入层留在 CPU，输出层也参与计数；N 个重复层的完整兼容数值通常是 N + 1。详细预算与校准方法见 /advisor 学习台。">?</button></span>
               <div class="auto-control"><select class="auto-mode" data-target="gpuLayers"><option value="auto">&#x81ea;&#x52a8;</option><option value="manual">&#x624b;&#x52a8;</option></select><input id="gpuLayers" type="number" min="0" /></div>
               <div class="tip-panel" id="tip-gpuLayers" hidden></div>
             </label>

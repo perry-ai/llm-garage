@@ -2,19 +2,15 @@
 setlocal
 cd /d "%~dp0"
 
-set LLMGARAGE_URL=http://127.0.0.1:58001
-
 where py >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-  start "" "%LLMGARAGE_URL%"
-  py -3 app.py
+  py -3 app.py --replace --open-browser
   exit /b %ERRORLEVEL%
 )
 
 where python >nul 2>nul
 if %ERRORLEVEL% EQU 0 (
-  start "" "%LLMGARAGE_URL%"
-  python app.py
+  python app.py --replace --open-browser
   exit /b %ERRORLEVEL%
 )
 
